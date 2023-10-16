@@ -43,7 +43,7 @@ capstone = {version = '0.11', optional = true}
 symbolic = {version = '12.1'}
 symbolic-demangle = {version = '12.1', default-features = false, features = ["cpp", "msvc", "rust"]}
 memoffset = {version = '0.9', features = ['unstable_const']}
-ezlua = {version = '0.3', features = ['serde_bytes'], optional = true}
+ezlua = {version = '0.4', features = ['serde_bytes'], optional = true}
 serde = {version = "1.0", default-features = false, features = ['derive', 'rc', 'alloc']}
 iced-x86 = {version = '1.20', default-features = false, features = ['decoder', 'std']}
 

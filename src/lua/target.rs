@@ -77,6 +77,8 @@ impl UserData for ArcTarget {
             .add_deref("readU64", <dyn UDbgTarget>::read_value::<u64>)?
             .add_deref("readF32", <dyn UDbgTarget>::read_value::<f32>)?
             .add_deref("readF64", <dyn UDbgTarget>::read_value::<f64>)?
+            .add_deref("readPtr", <dyn UDbgTarget>::read_ptr)?
+            .add_deref("writePtr", <dyn UDbgTarget>::write_ptr)?
             .add_deref("parseAddress", <dyn UDbgTarget>::parse_address)?
             .add_deref("getSymbol", <dyn UDbgTarget>::get_symbol_string)?
             .add_deref("getSymbolInfo", <dyn UDbgTarget>::get_symbol_)?
