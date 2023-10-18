@@ -37,6 +37,7 @@ pub mod event;
 #[cfg(feature = "ezlua")]
 pub mod lua;
 pub mod memory;
+#[cfg(feature = "minidump")]
 pub mod minidump;
 pub mod os;
 pub mod pdbfile;

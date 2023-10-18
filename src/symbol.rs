@@ -8,16 +8,15 @@ use crate::{
 
 use core::cell::Cell;
 use parking_lot::RwLock;
-use spin::RwLock as SpinRW;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[cfg(windows)]
 use unicase::UniCase;
 #[cfg(windows)]
-type ModKey = UniCase<Arc<str>>;
+pub type PathKey = UniCase<Arc<str>>;
 #[cfg(not(windows))]
-type ModKey = Arc<str>;
+pub type PathKey = Arc<str>;
 
 bitflags! {
     pub struct SymbolFlags: u32 {
@@ -286,7 +285,7 @@ pub struct SymbolsData {
     pub pdb_sig: Box<str>,
     /// PDB file name
     pub pdb_name: Box<str>,
-    pub pdb: SpinRW<Option<Arc<dyn SymbolFile>>>,
+    pub pdb: RwLock<Option<Arc<dyn SymbolFile>>>,
 }
 
 impl SymbolsData {
@@ -430,7 +429,7 @@ pub trait UDbgModule: GetProp {
             *syms.pdb.write() = Some(match path {
                 // TODO:
                 #[cfg(windows)]
-                Some(path) => Arc::new(crate::pdbfile::PDBData::load(path, None)?),
+                Some(path) => crate::pdbfile::PDBData::load(path, None)?,
                 #[cfg(not(windows))]
                 Some(_) => return Err(UDbgError::NotSupport),
                 None => return Err(UDbgError::NotFound),
@@ -510,7 +509,7 @@ pub trait TargetSymbol {
 #[derive(Default)]
 pub struct ModuleManager<T: UDbgModule> {
     pub list: Vec<Arc<T>>,
-    map: BTreeMap<ModKey, Arc<T>>,
+    map: BTreeMap<PathKey, Arc<T>>,
 }
 
 impl<T: UDbgModule> ModuleManager<T> {
@@ -585,7 +584,7 @@ impl<T: UDbgModule> ModuleManager<T> {
 
     pub fn get_module(&self, name: &str) -> Option<Arc<T>> {
         #[cfg(windows)]
-        let name: ModKey = UniCase::new(name.into());
+        let name: PathKey = UniCase::new(name.into());
         #[cfg(windows)]
         let name = &name;
         self.map.get(name).map(Clone::clone)

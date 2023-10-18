@@ -16,7 +16,7 @@ use core::{
     task::{Context, Poll},
 };
 use futures::task::{waker_ref, ArcWake};
-use spin::mutex::Mutex;
+use parking_lot::Mutex;
 use std::{cell::Cell, rc::Rc};
 use std::{sync::Arc, time::Instant};
 

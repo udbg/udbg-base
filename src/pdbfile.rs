@@ -3,10 +3,11 @@
 //!
 
 use anyhow::Context;
+use arc_swap::ArcSwapOption;
+use lru_cache::LruCache;
+use parking_lot::{Mutex, RwLock};
 use pdb::{FallibleIterator, ItemIter, MemberType, SymbolData, TypeData, TypeIndex, PDB};
-
-use spin::Mutex;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::{fs::File, io::ErrorKind};
 
 use crate::{pe, prelude::*, shell::udbg_ui};
@@ -323,19 +324,33 @@ impl PdbFile {
     }
 }
 
+pub static PDB_CACHE: LazyLock<RwLock<LruCache<PathKey, Arc<PDBData>>>> =
+    LazyLock::new(|| RwLock::new(LruCache::new(128)));
+
 pub struct PDBData {
     pub file: Mutex<PdbFile>,
     pub path: Arc<str>,
-    pub global: Mutex<Option<Arc<SymbolMap>>>,
+    pub global: ArcSwapOption<SymbolMap>,
 }
 
+unsafe impl Sync for PDBData {}
+unsafe impl Send for PDBData {}
+
 impl PDBData {
-    pub fn load(path: &str, pe: Option<&pe::PeHelper>) -> anyhow::Result<PDBData> {
-        Ok(Self {
-            file: PdbFile::load(path, pe)?.into(),
-            path: path.into(),
-            global: None.into(),
-        })
+    pub fn load(path: impl Into<Arc<str>>, pe: Option<&pe::PeHelper>) -> anyhow::Result<Arc<Self>> {
+        let path = path.into();
+        let key: PathKey = path.clone().into();
+        if let Some(result) = PDB_CACHE.write().get_mut(&key).cloned() {
+            return Ok(result);
+        }
+
+        let result = Arc::new(Self {
+            file: PdbFile::load(&path, pe)?.into(),
+            path,
+            global: ArcSwapOption::empty(),
+        });
+        PDB_CACHE.write().insert(key, result.clone());
+        Ok(result.clone())
     }
 }
 
@@ -365,12 +380,12 @@ impl SymbolFile for PDBData {
     }
 
     fn global(&self) -> anyhow::Result<Arc<SymbolMap>> {
-        let result = self.global.lock().clone();
+        let result = self.global.load_full();
         match result {
             Some(r) => Ok(r.clone()),
             None => {
                 let r = Arc::new(self.file.lock().global()?);
-                *self.global.lock() = r.clone().into();
+                self.global.store(r.clone().into());
                 Ok(r)
             }
         }
@@ -407,8 +422,8 @@ impl pe::PeHelper<'_> {
         let mut err = None;
         for p in paths.iter() {
             if p.exists() {
-                match PDBData::load(&p.to_string_lossy(), self.into()) {
-                    Ok(pdb) => return Ok(pdb.into()),
+                match PDBData::load(p.to_string_lossy().as_ref(), self.into()) {
+                    Ok(pdb) => return Ok(pdb),
                     Err(e) => err = Some(e),
                 }
             }
