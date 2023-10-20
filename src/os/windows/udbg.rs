@@ -1,12 +1,17 @@
 use super::*;
 
-use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::mem::transmute;
 use std::ops::Deref;
 use std::ptr::null_mut;
 use std::sync::Arc;
+use std::{
+    cell::{Cell, RefCell, UnsafeCell},
+    sync::LazyLock,
+};
 
+use arc_swap::ArcSwapOption;
+use lru_cache::LruCache;
 use ntapi::FIELD_OFFSET;
 use winapi::um::winnt::CONTEXT_ALL;
 use winapi::um::{errhandlingapi::GetLastError, winnt::CONTEXT_DEBUG_REGISTERS};
@@ -42,20 +47,53 @@ pub enum HandleResult {
 
 pub struct Module {
     pub data: ModuleData,
-    pub syms: SymbolsData,
-    pub funcs: Vec<RUNTIME_FUNCTION>,
+    pub syms: ArcSwapOption<SymbolsData>,
     file: HANDLE,
 }
 
-impl Module {}
+pub static MODULE_CACHE: LazyLock<RwLock<LruCache<PathKey, Arc<SymbolsData>>>> =
+    LazyLock::new(|| RwLock::new(LruCache::new(128)));
+
+impl Module {
+    pub fn cache_load_syms(&self) -> Arc<SymbolsData> {
+        self.syms
+            .load_full()
+            .or_else(|| {
+                MODULE_CACHE
+                    .write()
+                    .get_mut(&self.data.path.clone().into())
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                let mmap = map_or_open(self.file, &self.data.path)
+                    .log_error_with(|err| format!("map: {}: {err:?}", self.data.path));
+                let syms = Arc::new(
+                    if let Some(pe) = mmap
+                        .as_ref()
+                        .and_then(|m| PeHelper::parse(m).log_error("parse pe"))
+                    {
+                        pe.symbols_data(&self.data.path)
+                    } else {
+                        SymbolsData::default()
+                    },
+                );
+
+                MODULE_CACHE
+                    .write()
+                    .insert(self.data.path.clone().into(), syms.clone());
+                self.syms.store(Some(syms.clone()));
+                syms
+            })
+    }
+}
 
 impl GetProp for Module {
     fn get_prop(&self, key: &str) -> UDbgResult<SerdeVal> {
         Ok(SerdeVal::String(match key {
-            "pdb_sig" => self.syms.pdb_sig.to_string(),
-            "pdb_name" => self.syms.pdb_name.to_string(),
+            "pdb_sig" => self.cache_load_syms().pdb_sig.to_string(),
+            "pdb_name" => self.cache_load_syms().pdb_name.to_string(),
             "pdb_path" => self
-                .syms
+                .cache_load_syms()
                 .pdb
                 .read()
                 .as_ref()
@@ -72,7 +110,7 @@ impl UDbgModule for Module {
     }
     // fn is_32(&self) -> bool { IS_ARCH_X64 || IS_ARCH_ARM64 }
     fn symbol_status(&self) -> SymbolStatus {
-        if self.syms.pdb.read().is_some() {
+        if self.cache_load_syms().pdb.read().is_some() {
             SymbolStatus::Loaded
         } else {
             SymbolStatus::Unload
@@ -80,11 +118,13 @@ impl UDbgModule for Module {
     }
 
     fn symbols_data(&self) -> Option<&SymbolsData> {
-        Some(&self.syms)
+        let syms = self.cache_load_syms();
+        // Safety: stored in self.syms
+        Some(unsafe { core::mem::transmute(syms.as_ref()) })
     }
 
     fn runtime_function(&self) -> Option<&[RUNTIME_FUNCTION]> {
-        self.funcs.as_slice().into()
+        self.symbols_data().map(|m| m.funcs.as_slice())
     }
 }
 
@@ -178,17 +218,9 @@ impl TargetSymbol for SymbolManager<Module> {
             path: path.into(),
         };
 
-        let mut funcs: Vec<RUNTIME_FUNCTION> = Default::default();
-        let syms = if let Ok(pe) = PeHelper::parse(&m) {
-            funcs = pe.runtime_functions();
-            pe.symbols_data(path)
-        } else {
-            SymbolsData::default()
-        };
         symgr.add(Module {
             data,
-            funcs,
-            syms: syms.into(),
+            syms: ArcSwapOption::empty(),
             file,
         });
         true
@@ -702,9 +734,9 @@ impl TargetCommon {
                 );
             });
         }
+
         // 移除已经卸载了的模块
         for m in rest_loaded {
-            // println!("remove: {:x}", m);
             self.symgr.remove(m);
         }
     }

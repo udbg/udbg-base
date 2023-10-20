@@ -76,7 +76,7 @@ impl UDbgModule for Module {
     }
 
     fn enum_symbol(&self, pat: Option<&str>) -> UDbgResult<Box<dyn Iterator<Item = Symbol>>> {
-        Ok(Box::new(self.syms.enum_symbol(pat)?.into_iter()))
+        Ok(Box::new(self.syms.enum_symbol(pat)?))
     }
     fn get_exports(&self) -> Option<Vec<Symbol>> {
         Some(self.syms.exports.iter().map(|i| i.1.clone()).collect())

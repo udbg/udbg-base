@@ -339,17 +339,19 @@ unsafe impl Send for PDBData {}
 impl PDBData {
     pub fn load(path: impl Into<Arc<str>>, pe: Option<&pe::PeHelper>) -> anyhow::Result<Arc<Self>> {
         let path = path.into();
-        let key: PathKey = path.clone().into();
-        if let Some(result) = PDB_CACHE.write().get_mut(&key).cloned() {
-            return Ok(result);
-        }
+
+        // NOTE: disable the pdb cache because SymbolsData cache is enabled
+        // let key: PathKey = path.clone().into();
+        // if let Some(result) = PDB_CACHE.write().get_mut(&key).cloned() {
+        //     return Ok(result);
+        // }
 
         let result = Arc::new(Self {
             file: PdbFile::load(&path, pe)?.into(),
             path,
             global: ArcSwapOption::empty(),
         });
-        PDB_CACHE.write().insert(key, result.clone());
+        // PDB_CACHE.write().insert(key, result.clone());
         Ok(result.clone())
     }
 }

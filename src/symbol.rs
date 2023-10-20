@@ -6,10 +6,10 @@ use crate::{
     consts::*, error::*, pe::PeHelper, prelude::GetProp, range::RangeValue, shell::udbg_ui,
 };
 
+use anyhow::Context;
 use core::cell::Cell;
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 #[cfg(windows)]
 use unicase::UniCase;
@@ -286,7 +286,12 @@ pub struct SymbolsData {
     /// PDB file name
     pub pdb_name: Box<str>,
     pub pdb: RwLock<Option<Arc<dyn SymbolFile>>>,
+    #[cfg(windows)]
+    pub funcs: Vec<RUNTIME_FUNCTION>,
 }
+
+unsafe impl Sync for SymbolsData {}
+unsafe impl Send for SymbolsData {}
 
 impl SymbolsData {
     pub fn add_symbol(&self, offset: usize, name: &str) -> UDbgResult<()> {
@@ -321,28 +326,36 @@ impl SymbolsData {
             .or_else(|| self.exports.get_symbol(name))
     }
 
-    pub fn enum_symbol<'a>(&'a self, pat: Option<&str>) -> UDbgResult<Vec<Symbol>> {
-        let global = self.pdb.read().as_ref().and_then(|p| p.global().ok());
+    pub fn enum_symbol(&self, pat: Option<&str>) -> UDbgResult<impl Iterator<Item = Symbol> + '_> {
+        let global = self
+            .pdb
+            .read()
+            .as_ref()
+            .and_then(|p| p.global().ok())
+            .unwrap_or_else(|| Arc::new(Default::default()));
         let user_syms = self.user_syms.read();
+        let clone_pair = |(k, v): (&usize, &Symbol)| (k.clone(), v.clone());
+        // Safety: global is hold by the returned closure
+        let g: &'static SymbolMap = unsafe { core::mem::transmute(global.as_ref()) };
         let iter = user_syms
             .iter()
-            .chain(global.iter().map(|s| s.iter()).flatten())
-            .chain(self.exports.iter());
-        let pattern =
-            glob::Pattern::new(pat.unwrap_or("*")).map_err(|e| format!("pattern: {:?}", e))?;
+            .map(clone_pair)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain(g.iter().map(clone_pair))
+            .chain(self.exports.iter().map(clone_pair));
+        let pattern = glob::Pattern::new(pat.unwrap_or("*")).context("pattern")?;
         let options = glob::MatchOptions {
             case_sensitive: false,
             ..Default::default()
         };
-        Ok(iter
-            .filter_map(|(_, s)| {
-                if pattern.matches_with(s.name.as_ref(), options) {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
-            .collect())
+        let mut iter = iter
+            .filter(move |(_, s)| pattern.matches_with(s.name.as_ref(), options))
+            .map(|(_, sym)| sym);
+        Ok(core::iter::from_fn(move || {
+            let _ = global;
+            iter.next()
+        }))
     }
 }
 
@@ -426,7 +439,7 @@ pub trait UDbgModule: GetProp {
     fn load_symbol_file(&self, path: Option<&str>) -> UDbgResult<()> {
         #[allow(unreachable_code)]
         if let Some(syms) = self.symbols_data() {
-            *syms.pdb.write() = Some(match path {
+            syms.pdb.write().replace(match path {
                 // TODO:
                 #[cfg(windows)]
                 Some(path) => crate::pdbfile::PDBData::load(path, None)?,
@@ -443,7 +456,7 @@ pub trait UDbgModule: GetProp {
     /// enumerate symbols by optional wildcard
     fn enum_symbol(&self, pat: Option<&str>) -> UDbgResult<Box<dyn Iterator<Item = Symbol> + '_>> {
         if let Some(syms) = self.symbols_data() {
-            Ok(Box::new(syms.enum_symbol(pat)?.into_iter()))
+            Ok(Box::new(syms.enum_symbol(pat)?))
         } else {
             Err(UDbgError::NotSupport)
         }
@@ -733,6 +746,7 @@ impl PeHelper<'_> {
             exports: self.exported_symbols(),
             pdb_name: pdb_name.into(),
             pdb_sig: pdb_sig.into(),
+            funcs: self.runtime_functions(),
         }
     }
 }

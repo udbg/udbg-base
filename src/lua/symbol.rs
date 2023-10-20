@@ -39,11 +39,16 @@ pub struct ArcSymbolFile(pub Arc<dyn SymbolFile>);
 impl UserData for ArcSymbolFile {
     const TYPE_NAME: &'static str = "SymbolFile*";
 
-    fn methods(mt: UserdataRegistry<Self>) -> LuaResult<()> {
+    fn metatable(mt: UserdataRegistry<Self>) -> LuaResult<()> {
         #[cfg(windows)]
         mt.set_closure("open", |path: &str| {
-            crate::pdbfile::PDBData::load(path, None).map(|r| ArcSymbolFile(Arc::new(r)))
+            crate::pdbfile::PDBData::load(path, None).map(|r| ArcSymbolFile(r as _))
         })?;
+
+        Ok(())
+    }
+
+    fn methods(mt: UserdataRegistry<Self>) -> LuaResult<()> {
         mt.add_method("path", |_, this, ()| this.path())?;
         mt.set_closure("getType", |this: &Self, id: u32| {
             this.get_type(id).map(SerdeValue)
