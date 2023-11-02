@@ -1,17 +1,13 @@
 use super::*;
 
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::mem::transmute;
 use std::ops::Deref;
 use std::ptr::null_mut;
 use std::sync::Arc;
-use std::{
-    cell::{Cell, RefCell, UnsafeCell},
-    sync::LazyLock,
-};
 
 use arc_swap::ArcSwapOption;
-use lru_cache::LruCache;
 use ntapi::FIELD_OFFSET;
 use winapi::um::winnt::CONTEXT_ALL;
 use winapi::um::{errhandlingapi::GetLastError, winnt::CONTEXT_DEBUG_REGISTERS};
@@ -51,15 +47,12 @@ pub struct Module {
     file: HANDLE,
 }
 
-pub static MODULE_CACHE: LazyLock<RwLock<LruCache<PathKey, Arc<SymbolsData>>>> =
-    LazyLock::new(|| RwLock::new(LruCache::new(128)));
-
 impl Module {
     pub fn cache_load_syms(&self) -> Arc<SymbolsData> {
         self.syms
             .load_full()
             .or_else(|| {
-                MODULE_CACHE
+                crate::symbol::MODULE_CACHE
                     .write()
                     .get_mut(&self.data.path.clone().into())
                     .cloned()
@@ -78,7 +71,7 @@ impl Module {
                     },
                 );
 
-                MODULE_CACHE
+                crate::symbol::MODULE_CACHE
                     .write()
                     .insert(self.data.path.clone().into(), syms.clone());
                 self.syms.store(Some(syms.clone()));
@@ -162,9 +155,9 @@ impl TargetSymbol for SymbolManager<Module> {
         let m = match &mmap {
             Ok(m) => m,
             Err(err) => {
-                ui.warn(format!("map {path} failed: {err:?}"));
+                log::warn!(target: "udbg", "map {path} failed: {err:?}");
                 if read.read_memory(base, &mut buf).is_none() {
-                    ui.error(format!("read pe falied: {:x} {}", base, path));
+                    log::error!(target: "udbg", "read pe falied: {:x} {}", base, path);
                     return false;
                 }
                 buf.as_slice()
@@ -173,14 +166,14 @@ impl TargetSymbol for SymbolManager<Module> {
         let h = match Header::parse(&m) {
             Ok(h) => h,
             Err(err) => {
-                ui.error(format!("parse {} failed: {:?}", path, err));
+                log::error!(target: "udbg", "parse {} failed: {:?}", path, err);
                 return false;
             }
         };
         let o = match &h.optional_header {
             Some(o) => o,
             None => {
-                ui.error(format!("no optional_header: {}", path));
+                log::error!(target: "udbg", "no optional_header: {}", path);
                 return false;
             }
         };
@@ -394,7 +387,7 @@ impl TargetCommon {
 
     pub fn handle_breakpoint<C: DbgContext, T: Deref<Target = Self> + UDbgTarget>(
         &self,
-        eh: &mut dyn EventHandler<T>,
+        eh: &dyn EventHandler<T>,
         first: bool,
         tb: &mut TraceBuf<T>,
         context: &mut C,
@@ -443,7 +436,7 @@ impl TargetCommon {
 
     pub fn handle_bp_has_data<C: DbgContext, T: Deref<Target = Self> + UDbgTarget>(
         &self,
-        eh: &mut dyn EventHandler<T>,
+        eh: &dyn EventHandler<T>,
         bp: Arc<Breakpoint>,
         tb: &mut TraceBuf<T>,
         context: &mut C,
@@ -537,7 +530,7 @@ impl TargetCommon {
 
     pub fn handle_possible_table_bp<C: DbgContext, T: Deref<Target = Self> + UDbgTarget>(
         &self,
-        eh: &mut dyn EventHandler<T>,
+        eh: &dyn EventHandler<T>,
         tb: &mut TraceBuf<T>,
         context: &mut C,
     ) -> HandleResult {
@@ -711,6 +704,7 @@ impl TargetCommon {
         for m in self
             .process
             .get_module_list(LIST_MODULES_ALL)
+            .log_error("EnumProcessModulesEx")
             .unwrap_or_default()
         {
             rest_loaded.remove(&m);
@@ -1159,11 +1153,11 @@ impl<T: UDbgTarget> TraceContext for TraceBuf<'_, T> {
 
 pub trait EventHandler<T = ProcessTarget> {
     /// fetch a debug event
-    fn fetch(&mut self, buf: &mut TraceBuf<T>) -> Option<()>;
+    fn fetch(&self, buf: &mut TraceBuf<T>) -> Option<()>;
     /// handle the debug event
-    fn handle(&mut self, buf: &mut TraceBuf<T>) -> Option<HandleResult>;
+    fn handle(&self, buf: &mut TraceBuf<T>) -> Option<HandleResult>;
     /// continue debug event
-    fn cont(&mut self, _: HandleResult, buf: &mut TraceBuf<T>);
+    fn cont(&self, _: HandleResult, buf: &mut TraceBuf<T>);
 }
 
 pub fn enum_udbg_thread<'a>(
@@ -1209,21 +1203,21 @@ pub fn enum_udbg_thread<'a>(
 }
 
 pub struct DefaultEngine {
-    targets: Vec<Arc<ProcessTarget>>,
+    targets: RwLock<Vec<Arc<ProcessTarget>>>,
     event: DEBUG_EVENT,
 }
 
 impl Default for DefaultEngine {
     fn default() -> Self {
         Self {
-            targets: vec![],
+            targets: vec![].into(),
             event: unsafe { core::mem::zeroed() },
         }
     }
 }
 
 impl DefaultEngine {
-    fn update_context(&mut self, tb: &mut TraceBuf) {
+    fn update_context(&self, tb: &mut TraceBuf) {
         let this = tb.target.clone();
         let cx = unsafe { tb.cx.as_mut().unwrap() };
         if this.get_context(self.event.dwThreadId, cx) {
@@ -1239,24 +1233,24 @@ impl DefaultEngine {
 }
 
 impl UDbgEngine for DefaultEngine {
-    fn open(&mut self, pid: u32) -> UDbgResult<Arc<dyn UDbgTarget>> {
+    fn open(&self, pid: u32) -> UDbgResult<Arc<dyn UDbgTarget>> {
         let result = ProcessTarget::open(pid)?;
         // self.targets.push(result.clone());
         Ok(result)
     }
 
-    fn attach(&mut self, pid: u32) -> UDbgResult<Arc<dyn UDbgTarget>> {
+    fn attach(&self, pid: u32) -> UDbgResult<Arc<dyn UDbgTarget>> {
         unsafe {
             DebugActiveProcess(pid)?;
             let result = ProcessTarget::open(pid)?;
             result.attached.set(true);
-            self.targets.push(result.clone());
+            self.targets.write().push(result.clone());
             Ok(result)
         }
     }
 
     fn create(
-        &mut self,
+        &self,
         path: &str,
         cwd: Option<&str>,
         args: &[&str],
@@ -1264,20 +1258,21 @@ impl UDbgEngine for DefaultEngine {
         let mut pi: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
         let ppid = udbg_ui().get_config("ppid");
         let result = ProcessTarget::new(create_debug_process(path, cwd, args, &mut pi, ppid)?);
-        self.targets.push(result.clone());
+        self.targets.write().push(result.clone());
         Ok(result)
     }
 
-    fn event_loop(&mut self, callback: &mut UDbgCallback) -> UDbgResult<()> {
+    fn event_loop(&self, callback: &mut UDbgCallback) -> UDbgResult<()> {
         let mut cx = unsafe { Align16::<CONTEXT>::new_zeroed() };
         let mut cx32 = unsafe { core::mem::zeroed() };
 
         let target = self
             .targets
+            .read()
             .iter()
             .next()
-            .map(Clone::clone)
-            .expect("no attached target");
+            .cloned()
+            .context("no attached target")?;
         target.base.status.set(UDbgStatus::Attached);
 
         let mut buf = TraceBuf {
@@ -1300,15 +1295,19 @@ impl UDbgEngine for DefaultEngine {
 }
 
 impl EventHandler for DefaultEngine {
-    fn fetch(&mut self, tb: &mut TraceBuf) -> Option<()> {
-        self.event = wait_for_debug_event(INFINITE)?;
+    fn fetch(&self, tb: &mut TraceBuf) -> Option<()> {
+        unsafe {
+            *((&self.event as *const DEBUG_EVENT) as *mut DEBUG_EVENT).as_mut()? =
+                wait_for_debug_event(INFINITE)?;
+        }
         if self.event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT {
-            if self
+            let not_traced = self
                 .targets
+                .read()
                 .iter()
                 .find(|p| p.base.pid.get() == self.event.dwProcessId)
-                .is_none()
-            {
+                .is_none();
+            if not_traced {
                 let target =
                     ProcessTarget::open(self.event.dwProcessId).expect("attach child process");
                 target
@@ -1319,12 +1318,13 @@ impl EventHandler for DefaultEngine {
                     } else {
                         UDbgStatus::Detaching
                     });
-                self.targets.push(target);
+                self.targets.write().push(target);
             }
         }
 
         let this = self
             .targets
+            .read()
             .iter()
             .find(|p| p.base.pid.get() == self.event.dwProcessId)
             .expect("not a traced process")
@@ -1341,7 +1341,7 @@ impl EventHandler for DefaultEngine {
         Some(())
     }
 
-    fn handle(&mut self, tb: &mut TraceBuf) -> Option<HandleResult> {
+    fn handle(&self, tb: &mut TraceBuf) -> Option<HandleResult> {
         let mut cotinue_status = HandleResult::Continue;
         unsafe {
             use UEvent::*;
@@ -1354,7 +1354,7 @@ impl EventHandler for DefaultEngine {
             match self.event.dwDebugEventCode {
                 CREATE_PROCESS_DEBUG_EVENT => {
                     if this.status.get() == UDbgStatus::Detaching {
-                        self.targets.pop();
+                        self.targets.write().pop();
                         return Some(cotinue_status);
                     }
                     let info = self.event.u.CreateProcessInfo;
@@ -1379,8 +1379,9 @@ impl EventHandler for DefaultEngine {
                     let code = self.event.u.ExitProcess.dwExitCode;
                     tb.call(ProcessExit(code));
                     self.targets
+                        .write()
                         .retain(|p| p.base.pid.get() != self.event.dwProcessId);
-                    if self.targets.is_empty() {
+                    if self.targets.read().is_empty() {
                         return None;
                     }
                 }
@@ -1548,7 +1549,7 @@ impl EventHandler for DefaultEngine {
         Some(cotinue_status)
     }
 
-    fn cont(&mut self, status: HandleResult, tb: &mut TraceBuf) {
+    fn cont(&self, status: HandleResult, tb: &mut TraceBuf) {
         let this = tb.target.clone();
         let cx32 = this.cx32.get();
         if !cx32.is_null() {
@@ -1575,7 +1576,7 @@ impl EventHandler for DefaultEngine {
                     UDbgError::system()
                 ));
             }
-            self.targets.retain(|t| !Arc::ptr_eq(&this, t));
+            self.targets.write().retain(|t| !Arc::ptr_eq(&this, t));
         }
     }
 }

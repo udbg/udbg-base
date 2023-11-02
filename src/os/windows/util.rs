@@ -333,7 +333,9 @@ pub fn map_or_open(file: HANDLE, path: &str) -> anyhow::Result<memmap2::Mmap> {
     } else {
         unsafe {
             let f = std::fs::File::from_raw_handle(file.0 as _);
-            memmap2::Mmap::map(&f).map_err(Into::into)
+            let result = memmap2::Mmap::map(&f).map_err(Into::into);
+            core::mem::forget(f);
+            result
         }
     }
 }

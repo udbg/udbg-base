@@ -1,5 +1,8 @@
 use super::*;
 
+ezlua::impl_tolua_as_serde!(UDbgFlags);
+ezlua::impl_fromlua_as_serde!(UDbgFlags);
+
 impl UserData for Symbol {
     const TYPE_NAME: &'static str = "UDbgSymbol";
 
@@ -37,7 +40,11 @@ impl ToLuaMulti for FieldInfo {
 pub struct ArcSymbolFile(pub Arc<dyn SymbolFile>);
 
 impl UserData for ArcSymbolFile {
-    const TYPE_NAME: &'static str = "SymbolFile*";
+    const TYPE_NAME: &'static str = "SymbolFile";
+
+    fn metatable_key() -> MetatableKey {
+        Self::METATABLE_KEY
+    }
 
     fn metatable(mt: UserdataRegistry<Self>) -> LuaResult<()> {
         #[cfg(windows)]

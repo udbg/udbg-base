@@ -8,8 +8,12 @@ use crate::{
 
 use anyhow::Context;
 use core::cell::Cell;
+use lru_cache::LruCache;
 use parking_lot::RwLock;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, LazyLock},
+};
 
 #[cfg(windows)]
 use unicase::UniCase;
@@ -17,6 +21,9 @@ use unicase::UniCase;
 pub type PathKey = UniCase<Arc<str>>;
 #[cfg(not(windows))]
 pub type PathKey = Arc<str>;
+
+pub static MODULE_CACHE: LazyLock<RwLock<LruCache<PathKey, Arc<SymbolsData>>>> =
+    LazyLock::new(|| RwLock::new(LruCache::new(128)));
 
 bitflags! {
     pub struct SymbolFlags: u32 {
@@ -194,17 +201,27 @@ impl SymbolInfo {
     }
 
     pub fn format(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
-        if self.symbol.len() > 0 {
-            if self.offset == 0 {
-                write!(w, "{}!{}", self.module, self.symbol)
+        fn format_module_name(this: &SymbolInfo, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+            if this.module.find(|c| c == '-' || c == '+').is_some() {
+                write!(w, "\"{}\"", this.module)
             } else {
-                write!(w, "{}!{}+{:x}", self.module, self.symbol, self.offset)
+                write!(w, "{}", this.module)
+            }
+        }
+
+        if self.symbol.len() > 0 {
+            format_module_name(self, w)?;
+            if self.offset == 0 {
+                write!(w, "!{}", self.symbol)
+            } else {
+                write!(w, "!{}+{:x}", self.symbol, self.offset)
             }
         } else if self.module.len() > 0 {
+            format_module_name(self, w)?;
             if self.mod_offset == 0 {
-                write!(w, "{}", self.module)
+                Ok(())
             } else {
-                write!(w, "{}+{:x}", self.module, self.mod_offset)
+                write!(w, "+{:x}", self.mod_offset)
             }
         } else {
             Ok(())
@@ -746,6 +763,7 @@ impl PeHelper<'_> {
             exports: self.exported_symbols(),
             pdb_name: pdb_name.into(),
             pdb_sig: pdb_sig.into(),
+            #[cfg(windows)]
             funcs: self.runtime_functions(),
         }
     }

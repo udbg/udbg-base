@@ -168,25 +168,19 @@ impl Process {
     }
 
     /// use EnumProcessModulesEx
-    pub fn get_module_list(&self, flag: ENUM_PROCESS_MODULES_EX_FLAGS) -> Option<Vec<usize>> {
+    pub fn get_module_list(&self, flag: ENUM_PROCESS_MODULES_EX_FLAGS) -> UDbgResult<Vec<usize>> {
         unsafe {
             let mut len = 0u32;
-            EnumProcessModulesEx(*self.handle, null_mut(), 0, &mut len, flag);
+            EnumProcessModulesEx(*self.handle, null_mut(), 0, &mut len, flag)?;
             let mut result = vec![0usize; len as usize];
-            if len > 0 {
-                if EnumProcessModulesEx(
-                    *self.handle,
-                    result.as_mut_ptr() as _,
-                    result.len() as u32,
-                    &mut len,
-                    flag,
-                )
-                .is_ok()
-                {
-                    return Some(result.into_iter().filter(|&m| m > 0).collect());
-                }
-            }
-            None
+            EnumProcessModulesEx(
+                *self.handle,
+                result.as_mut_ptr() as _,
+                result.len() as u32,
+                &mut len,
+                flag,
+            )?;
+            Ok(result.into_iter().filter(|&m| m > 0).collect())
         }
     }
 

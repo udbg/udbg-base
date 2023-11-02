@@ -1,7 +1,10 @@
 //! ELF file helper
 
-use goblin::elf::{header::*, sym::Sym, Elf};
-use goblin::strtab::Strtab;
+use goblin::{
+    elf::{header::*, sym::Sym, Elf},
+    elf64::{section_header::*, sym::*},
+    strtab::Strtab,
+};
 
 #[derive(Deref, Clone)]
 pub struct ElfSym<'a> {
@@ -16,12 +19,44 @@ impl ElfSym<'_> {
         self.sym.st_value as usize
     }
 
+    pub fn from_dynsyms<'a>(elf: &'a Elf, s: &Sym) -> Option<ElfSym<'a>> {
+        Self::from_raw(&elf.dynstrtab, s).or_else(|| ElfSym::from_raw(&elf.strtab, s))
+    }
+
     pub fn from_raw<'a>(e: &'a Strtab, s: &Sym) -> Option<ElfSym<'a>> {
         if s.st_value > 0 {
             e.get_at(s.st_name).map(|name| ElfSym { sym: *s, name })
         } else {
             None
         }
+    }
+
+    pub fn is_import(&self) -> bool {
+        // An import must not be defined in a section
+        self.st_shndx == SHN_UNDEF as usize
+        // An import must not have an address
+            && self.st_value == 0
+            // its name must not be empty
+            && self.st_name != 0
+            // It must have a GLOBAL or WEAK bind
+            && (self.st_bind() == STB_GLOBAL || self.st_bind() == STB_WEAK)
+            // It must be a FUNC or an OBJECT
+            && (self.st_type() == STT_FUNC
+                || self.st_type() == STT_GNU_IFUNC
+                || self.st_type() == STT_OBJECT)
+    }
+
+    pub fn is_export(&self) -> bool {
+        // An export must be defined in a section
+        self.st_shndx != SHN_UNDEF as usize
+            // An export must have an address
+                && self.st_value != 0
+                // An export must be bind to GLOBAL or WEAK
+                && (self.st_bind() == STB_GLOBAL || self.st_bind() == STB_WEAK)
+                // An export must have one of theses types:
+                && (self.st_type() == STT_FUNC
+                    || self.st_type() == STT_GNU_IFUNC
+                    || self.st_type() == STT_OBJECT)
     }
 }
 
@@ -30,9 +65,11 @@ pub struct ElfHelper<'a>(Elf<'a>);
 
 impl<'a> ElfHelper<'a> {
     pub fn enum_export(&'a self) -> impl 'a + Iterator<Item = ElfSym<'a>> {
-        self.0.dynsyms.iter().filter_map(move |s| {
-            ElfSym::from_raw(&self.0.dynstrtab, &s).or_else(|| ElfSym::from_raw(&self.0.strtab, &s))
-        })
+        self.0
+            .dynsyms
+            .iter()
+            .filter_map(move |s| ElfSym::from_dynsyms(self, &s))
+            .filter(ElfSym::is_export)
     }
 
     pub fn enum_symbol(&'a self) -> impl 'a + Iterator<Item = ElfSym<'a>> {
@@ -40,6 +77,13 @@ impl<'a> ElfHelper<'a> {
             .syms
             .iter()
             .filter_map(move |s| ElfSym::from_raw(&self.0.strtab, &s))
+    }
+
+    pub fn enum_dynsym(&'a self) -> impl 'a + Iterator<Item = ElfSym<'a>> {
+        self.0
+            .dynsyms
+            .iter()
+            .filter_map(move |s| ElfSym::from_dynsyms(self, &s))
     }
 
     pub fn get_export(&'a self, name: &str) -> Option<ElfSym<'a>> {

@@ -265,8 +265,9 @@ impl PETarget {
     pub fn new<P: AsRef<Path>>(path: P) -> UDbgResult<Self> {
         let path = path.as_ref().to_path_buf();
         let module = PEModule::new(&path)?;
-        let base = TargetBase::default();
+        let mut base = TargetBase::default();
         base.pid.set(1);
+        base.image_base = module.data.base;
         // base.arch
         let symgr = SymbolManager::default();
         symgr.base.write().list.push(module.into());
@@ -296,7 +297,10 @@ impl ReadMemory for PETarget {
             let sec = pe.helper.section_by_rva(rva)?;
             // TODO: section fill by zero
             let offset = (rva as u32 - sec.virtual_address + sec.pointer_to_raw_data) as usize;
-            (offset, (sec.virtual_size as usize).checked_sub(rva)?)
+            (
+                offset,
+                (sec.virtual_address as usize + sec.virtual_size as usize).checked_sub(rva)?,
+            )
         } else {
             (rva, page.size - rva)
         };

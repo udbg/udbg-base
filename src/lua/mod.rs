@@ -3,7 +3,7 @@
 use crate::{
     os::{pid_t, tid_t},
     prelude::*,
-    register::CpuReg,
+    register::{regid::COMM_REG_SP, CpuReg},
 };
 use ezlua::{ffi::lua_Integer, marker::*, prelude::*, serde::SerdeValue};
 use std::{cell::RefCell, sync::Arc};
@@ -39,13 +39,13 @@ pub fn init(s: &LuaState, t: &ValRef) -> LuaResult<()> {
     t.set("SymbolFile", s.register_usertype::<ArcSymbolFile>()?)?;
     t.set("UDbgTarget", s.register_usertype::<ArcTarget>()?)?;
     t.set("UDbgBreakpoint", s.register_usertype::<ArcBreakpoint>()?)?;
-    t.set("UDbgEngine", s.register_usertype::<BoxEngine>()?)?;
+    t.set("UDbgEngine", s.register_usertype::<ArcEngine>()?)?;
     t.set("UDbgThread", s.register_usertype::<BoxThread>()?)?;
     t.set("UDbgModule", s.register_usertype::<ArcModule>()?)?;
 
     t.set(
         "defaultEngine",
-        s.new_closure(|| BoxEngine(Box::new(crate::os::DefaultEngine::default())))?,
+        s.new_closure(|| ArcEngine::from(crate::os::DefaultEngine::default()))?,
     )?;
 
     let sf = s.new_table_with_size(0, 4)?;
@@ -67,32 +67,26 @@ pub fn init(s: &LuaState, t: &ValRef) -> LuaResult<()> {
     t.set("regid", regid)?;
 
     let event = s.new_table_with_size(0, 8)?;
+    #[rustfmt::skip]
     {
-        event.set("INIT_BP", INIT_BP)?;
-        event.set("BREAKPOINT", BREAKPOINT)?;
-        event.set("PROCESS_CREATE", PROCESS_CREATE)?;
-        event.set("PROCESS_EXIT", PROCESS_EXIT)?;
-        event.set("THREAD_CREATE", THREAD_CREATE)?;
-        event.set("THREAD_EXIT", THREAD_EXIT)?;
-        event.set("MODULE_LOAD", MODULE_LOAD)?;
-        event.set("MODULE_UNLOAD", MODULE_UNLOAD)?;
-        event.set("EXCEPTION", EXCEPTION)?;
-        event.set("STEP", STEP)?;
+        event.set("INIT_BP", INIT_BP)?; event.set(INIT_BP, "INIT_BP")?;
+        event.set("BREAKPOINT", BREAKPOINT)?; event.set(BREAKPOINT, "BREAKPOINT")?;
+        event.set("PROCESS_CREATE", PROCESS_CREATE)?; event.set(PROCESS_CREATE, "PROCESS_CREATE")?;
+        event.set("PROCESS_EXIT", PROCESS_EXIT)?; event.set(PROCESS_EXIT, "PROCESS_EXIT")?;
+        event.set("THREAD_CREATE", THREAD_CREATE)?; event.set(THREAD_CREATE, "THREAD_CREATE")?;
+        event.set("THREAD_EXIT", THREAD_EXIT)?; event.set(THREAD_EXIT, "THREAD_EXIT")?;
+        event.set("MODULE_LOAD", MODULE_LOAD)?; event.set(MODULE_LOAD, "MODULE_LOAD")?;
+        event.set("MODULE_UNLOAD", MODULE_UNLOAD)?; event.set(MODULE_UNLOAD, "MODULE_UNLOAD")?;
+        event.set("EXCEPTION", EXCEPTION)?; event.set(EXCEPTION, "EXCEPTION")?;
+        event.set("STEP", STEP)?; event.set(STEP, "STEP")?;
     }
     t.set("Event", event)?;
 
     Ok(())
 }
 
-impl ToLua for CpuReg {
-    #[inline(always)]
-    fn to_lua<'a>(self, s: &'a LuaState) -> LuaResult<ValRef<'a>> {
-        match self {
-            CpuReg::Int(n) => n.to_lua(s),
-            CpuReg::Flt(n) => n.to_lua(s),
-        }
-    }
-}
+ezlua::impl_tolua_as_serde!(CpuReg);
+ezlua::impl_fromlua_as_serde!(CpuReg);
 
 impl ToLua for HandleInfo {
     fn to_lua<'a>(self, lua: &'a LuaState) -> LuaResult<ValRef<'a>> {
@@ -207,74 +201,136 @@ impl ToLua for ProcessInfo {
 }
 
 #[derive(Deref, DerefMut)]
-pub struct BoxEngine(pub Box<dyn UDbgEngine>);
+pub struct ArcEngine(pub Arc<dyn UDbgEngine>);
 
-impl UserData for BoxEngine {
+impl<T: UDbgEngine + 'static> From<T> for ArcEngine {
+    fn from(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl<'a> FromLuaMulti<'a> for UserReply {
+    fn from_lua_multi(lua: &'a LuaState, begin: Index) -> LuaResult<Self> {
+        let (action, val) = <(LuaString, ValRef) as FromLuaMulti>::from_lua_multi(lua, begin)?;
+        Ok(match action.to_string_lossy().as_ref() {
+            "step" | "stepin" => UserReply::StepIn,
+            "stepout" => UserReply::StepOut,
+            "goto" => UserReply::Goto(val.to_integer() as usize),
+            "native" => UserReply::Native(val.to_integer() as usize),
+            "run" | _ => UserReply::Run(val.to_bool()),
+        })
+    }
+}
+
+impl UserData for ArcEngine {
     const TYPE_NAME: &'static str = "UDbgEngine";
+    const INDEX_USERVALUE: bool = true;
 
-    type Trans = RefCell<Self>;
+    fn metatable_key() -> MetatableKey {
+        Self::METATABLE_KEY
+    }
 
     fn methods(mt: UserdataRegistry<Self>) -> LuaResult<()> {
         mt.add("enumProcess", |this: &Self| {
             this.enum_process().map(StaticIter::from)
         })?
-        .add_mut("open", |this: &mut Self, pid: pid_t| {
+        .add("open", |this: &Self, pid: pid_t| {
             this.open(pid).map(ArcTarget::from)
         })?
-        .add_mut("attach", |this: &mut Self, pid: pid_t| {
+        .add("openSelf", |this: &Self, pid: pid_t| {
+            this.open_self().map(ArcTarget::from)
+        })?
+        .add("attach", |this: &Self, pid: pid_t| {
             this.attach(pid).map(ArcTarget)
         })?
-        .add_mut(
+        .add(
             "create",
-            |this: &mut Self, path: &str, cwd: Option<&str>, args: SerdeValue<Vec<&str>>| {
+            |this: &Self, path: &str, cwd: Option<&str>, args: SerdeValue<Vec<&str>>| {
                 this.create(path, cwd, &args).map(ArcTarget)
             },
         )?;
 
-        // TODO:
-        // mt.add_mut(
-        //     "event_loop",
-        //     |s: &LuaState, this: &mut Self, mut co: Coroutine| {
-        //         let ui = udbg_ui();
-        //         let mut resume = move |ctx: &dyn TraceContext, event| -> UserReply {
-        //             let this = ArcTarget(ctx.target());
-        //             let res =
-        //                 co.resume::<_, (Option<&str>, Value)>(ResumeArgs(this.clone(), event));
-        //             match res {
-        //                 Ok((action, _)) => match action.unwrap_or_default() {
-        //                     "step" | "stepin" => UserReply::StepIn,
-        //                     "stepout" => UserReply::StepOut,
-        //                     "goto" => UserReply::Goto(co.to_integer(-1) as usize),
-        //                     "native" => UserReply::Native(co.to_integer(-1) as usize),
-        //                     "run" | _ => UserReply::Run(co.to_bool(-1)),
-        //                 },
-        //                 Err(err) => {
-        //                     s.traceback(&co, cstr!("resume event"), 1);
-        //                     s.error();
-        //                 }
-        //             }
-        //         };
-        //         this.event_loop(&mut |ctx, event| resume(ctx, event));
-        //     },
-        // )?;
+        mt.add(
+            "eventLoop",
+            |lua: &LuaState, this: &Self, callback: LuaFunction| {
+                struct ResumeArgs<'a>(pub ArcTarget, pub ValRef<'a>, pub UEvent);
+
+                impl ToLuaMulti for ResumeArgs<'_> {
+                    fn push_multi(self, s: &LuaState) -> LuaResult<usize> {
+                        Ok((self.0, self.1).push_multi(s)? + self.2.push_multi(s)?)
+                    }
+                }
+
+                this.event_loop(&mut |ctx, event| {
+                    let this = ArcTarget(ctx.target());
+                    lua.new_val(ctx)
+                        .and_then(|ctx| {
+                            let result = callback.pcall::<_, UserReply>(ResumeArgs(
+                                this.clone(),
+                                ctx.clone(),
+                                event,
+                            ));
+                            ctx.close_and_remove_metatable()?;
+                            result
+                        })
+                        .unwrap_or_else(|err| {
+                            log::error!("[evetloop] {err:?}");
+                            UserReply::Run(false)
+                        })
+                })
+            },
+        )?;
 
         Ok(())
     }
 
     fn metatable(mt: UserdataRegistry<Self>) -> LuaResult<()> {
         mt.set_closure("default", || {
-            BoxEngine(Box::new(crate::os::DefaultEngine::default()))
+            ArcEngine(Arc::new(crate::os::DefaultEngine::default()))
         })?;
 
         Ok(())
     }
 }
 
-pub struct ResumeArgs(pub ArcTarget, pub UEvent);
+impl UserData for &mut dyn TraceContext {
+    type Trans = RefCell<Self>;
 
-impl ToLuaMulti for ResumeArgs {
-    fn push_multi(self, s: &LuaState) -> LuaResult<usize> {
-        Ok(self.0.push_multi(s)? + self.1.push_multi(s)?)
+    fn getter(fields: UserdataRegistry<Self>) -> LuaResult<()> {
+        fields.add_field_get("target", |_, this| ArcTarget(this.target()))?;
+        fields.add_field_get("pointerSize", |_, this| this.pointer_size())?;
+
+        Ok(())
+    }
+
+    fn methods(methods: UserdataRegistry<Self>) -> LuaResult<()> {
+        methods.add_method_mut("getRegister", |_, this, reg: ValRef| {
+            this.register().and_then(|regs| match reg.type_of() {
+                LuaType::String => regs.get(reg.to_str().unwrap_or_default()),
+                LuaType::Number => regs.get_reg(reg.to_integer() as _),
+                _ => None,
+            })
+        })?;
+        methods.add_method_mut("setRegister", |_, this, (reg, val): (ValRef, CpuReg)| {
+            this.register().map(|regs| match reg.type_of() {
+                LuaType::String => regs.set(reg.to_str().unwrap_or_default(), val),
+                LuaType::Number => regs.set_reg(reg.to_integer() as _, val),
+                _ => (),
+            })
+        })?;
+        methods.add_method_mut("argument", |_, this, i| {
+            let t = this.target();
+            this.register().map(|regs| match regs.argument(i, None) {
+                Ok(value) => regs.get_reg(value).map(|v| v.as_int()),
+                Err(value) => regs
+                    .get_reg(COMM_REG_SP)
+                    .map(|v| v.as_int())
+                    .and_then(|sp| t.read_ptr(sp + i * t.base().pointer_size())),
+            })
+        })?;
+        methods.add_method("exceptionParam", |_, this, i| this.exception_param(i))?;
+
+        Ok(())
     }
 }
 

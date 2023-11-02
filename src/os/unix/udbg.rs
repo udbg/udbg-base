@@ -13,6 +13,7 @@ pub struct TraceBuf<'a> {
     pub user: user_regs,
     pub regs_dirty: bool,
     pub si: siginfo_t,
+    pub tid: tid_t,
 }
 
 impl TraceBuf<'_> {
@@ -36,9 +37,9 @@ pub type HandleResult = Option<Signal>;
 
 pub trait EventHandler {
     /// fetch a debug event
-    fn fetch(&mut self, buf: &mut TraceBuf) -> Option<()>;
+    fn fetch(&self, buf: &mut TraceBuf) -> Option<()>;
     /// handle the debug event
-    fn handle(&mut self, buf: &mut TraceBuf) -> Option<HandleResult>;
+    fn handle(&self, buf: &mut TraceBuf) -> Option<HandleResult>;
     /// continue debug event
-    fn cont(&mut self, _: HandleResult, buf: &mut TraceBuf);
+    fn cont(&self, _: HandleResult, buf: &mut TraceBuf);
 }

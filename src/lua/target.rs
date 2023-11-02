@@ -13,6 +13,13 @@ impl std::ops::Deref for ArcTarget {
     }
 }
 
+impl<T: UDbgTarget> From<T> for ArcTarget {
+    fn from(value: T) -> Self {
+        value.base().status.set(UDbgStatus::Opened);
+        Self(Arc::new(value))
+    }
+}
+
 impl From<Arc<dyn UDbgTarget>> for ArcTarget {
     fn from(value: Arc<dyn UDbgTarget>) -> Self {
         value.base().status.set(UDbgStatus::Opened);
@@ -30,6 +37,10 @@ impl AsRef<dyn UDbgTarget> for ArcTarget {
 impl UserData for ArcTarget {
     const TYPE_NAME: &'static str = "UDbgTarget";
     const INDEX_USERVALUE: bool = true;
+
+    fn metatable_key() -> MetatableKey {
+        Self::METATABLE_KEY
+    }
 
     fn metatable(mt: UserdataRegistry<Self>) -> LuaResult<()> {
         mt.set_closure("Index", |this: &Self, key: &str| {
@@ -52,6 +63,7 @@ impl UserData for ArcTarget {
             .add_field_get("base", |_, this: &Self| SerdeValue(this.base()))?
             .set_closure("pid", |this: &Self| this.base().pid.get())?
             .set_closure("arch", |this: &Self| this.base().arch)?
+            .set_closure("imageBase", |this: &Self| this.base().image_base)?
             .set_closure("eventTid", |this: &Self| this.base().event_tid.get())?
             .set_closure("pointerSize", |this: &Self| this.base().pointer_size())?
             .set_closure("status", |this: &Self| this.base().status.get().as_str())?
@@ -100,19 +112,67 @@ impl UserData for ArcTarget {
             .set_closure("writeF32", write_value::<f32>)?
             .set_closure("writeF64", write_value::<f64>)?;
 
+        #[derive(Debug, Serialize, Deserialize)]
+        struct BpOption<'a> {
+            #[serde(rename = "type", default = "BpOption::default_type")]
+            type_: &'a str,
+            #[serde(default)]
+            size: usize,
+            #[serde(default = "BpOption::default_enable")]
+            enable: bool,
+            #[serde(default)]
+            temp: bool,
+            tid: Option<tid_t>,
+            #[serde(default)]
+            auto: bool,
+        }
+
+        ezlua::impl_tolua_as_serde!(BpOption<'_>);
+
+        impl<'a> FromLua<'a> for BpOption<'a> {
+            fn from_lua(lua: &'a LuaState, val: ValRef<'a>) -> LuaResult<Self> {
+                <SerdeValue<Self> as FromLua>::from_lua(lua, val).map(|s| s.0)
+            }
+        }
+
+        impl BpOption<'_> {
+            fn default_enable() -> bool {
+                true
+            }
+
+            fn default_type() -> &'static str {
+                "soft"
+            }
+        }
+
+        impl Default for BpOption<'_> {
+            fn default() -> Self {
+                Self {
+                    type_: Self::default_type(),
+                    size: 0,
+                    enable: Self::default_enable(),
+                    temp: false,
+                    tid: None,
+                    auto: false,
+                }
+            }
+        }
+
         let lua = mt.state();
         mt.set(
-            "add_breakpoint",
-            lua.new_closure6(
-                |s: &LuaState,
-                 this: &Self,
-                 a: usize,
-                 ty: Option<&str>,
-                 size: Option<usize>,
-                 temp: bool,
-                 tid: Option<tid_t>| {
-                    let r = match ty {
-                        Some("int3") | Some("soft") | None => this.add_breakpoint(BpOpt {
+            "addBreakpoint",
+            lua.new_closure3(
+                |s: &LuaState, this: &Self, a: usize, opt: Option<BpOption>| {
+                    let BpOption {
+                        type_,
+                        size,
+                        enable,
+                        temp,
+                        tid,
+                        auto,
+                    } = opt.unwrap_or_default();
+                    let r = match type_ {
+                        "int3" | "soft" => this.add_breakpoint(BpOpt {
                             address: a,
                             enable: false,
                             temp,
@@ -121,7 +181,7 @@ impl UserData for ArcTarget {
                             len: None,
                             table: false,
                         }),
-                        Some("table") => this.add_breakpoint(BpOpt {
+                        "table" => this.add_breakpoint(BpOpt {
                             address: a,
                             enable: false,
                             temp,
@@ -130,7 +190,7 @@ impl UserData for ArcTarget {
                             len: None,
                             rw: None,
                         }),
-                        Some(tys) => this.add_breakpoint(BpOpt {
+                        tys => this.add_breakpoint(BpOpt {
                             address: a,
                             enable: false,
                             temp,
@@ -143,10 +203,10 @@ impl UserData for ArcTarget {
                                 _ => return Err(LuaError::convert("Invalid breakpoint type")),
                             }),
                             len: Some(match size {
-                                Some(1) | None => HwbpLen::L1,
-                                Some(2) => HwbpLen::L2,
-                                Some(4) => HwbpLen::L4,
-                                Some(8) => HwbpLen::L8,
+                                1 => HwbpLen::L1,
+                                2 => HwbpLen::L2,
+                                4 => HwbpLen::L4,
+                                8 => HwbpLen::L8,
                                 _ => return Err(LuaError::convert("Invalid hwbp size")),
                             }),
                         }),
@@ -162,6 +222,9 @@ impl UserData for ArcTarget {
         mt.set_closure("getBreakpoint", |this: &Self, id: BpID| {
             this.get_breakpoint(id).map(ArcBreakpoint)
         })?;
+        mt.set_closure("hasBreakpoint", |this: &Self, id: BpID| {
+            this.get_breakpoint(id).is_some()
+        })?;
         mt.set_closure("breakpointList", |this: &Self| {
             IterVec(this.get_breakpoints().into_iter().map(ArcBreakpoint))
         })?;
@@ -175,14 +238,14 @@ impl UserData for ArcTarget {
         )?;
         #[cfg(windows)]
         mt.set_closure(
-            "readWstring",
+            "readWString",
             |this: &Self, a: usize, size: Option<usize>| this.read_wstring(a, size.unwrap_or(1000)),
         )?;
         mt.set_closure("writeString", |this: &Self, a: usize, buf: &[u8]| {
             this.write_cstring(a, buf)
         })?;
         #[cfg(windows)]
-        mt.set_closure("writeWstring", |this: &Self, a: usize, buf: &str| {
+        mt.set_closure("writeWString", |this: &Self, a: usize, buf: &str| {
             this.write_wstring(a, buf)
         })?;
 
@@ -223,19 +286,19 @@ impl UserData for ArcTarget {
 
         mt.add_method("enumModule", |s, this: &Self, ()| {
             this.enum_module()
-                .map(|r| unsafe { s.new_iter(r.map(ArcModule), [ArgRef(1)]) })
+                .map(|r| unsafe { s.new_iter(r.map(ArcModule), ArgRef(1)) })
         })?
         .add_method("enumThread", |s, this: &Self, detail: bool| {
             this.enum_thread(detail)
-                .map(|r| unsafe { s.new_iter(r.map(BoxThread), [ArgRef(1)]) })
+                .map(|r| unsafe { s.new_iter(r.map(BoxThread), ArgRef(1)) })
         })?
         .add_method("enumMemory", |s, this: &Self, ()| {
             this.enum_memory()
-                .map(|r| unsafe { s.new_iter(r, [ArgRef(1)]) })
+                .map(|r| unsafe { s.new_iter(r, ArgRef(1)) })
         })?
         .add_method("enumHandle", |s, this: &Self, ()| {
             this.enum_handle()
-                .map(|r| unsafe { s.new_iter(r, [ArgRef(1)]) })
+                .map(|r| unsafe { s.new_iter(r, ArgRef(1)) })
         })?;
 
         mt.set_closure("collectMemory", |this: &Self| {
@@ -437,21 +500,29 @@ impl UserData for ArcModule<'_> {
     }
 
     fn methods(mt: UserdataRegistry<Self>) -> LuaResult<()> {
-        // mt.as_deref()
-        //     .add_deref("add_symbol", <dyn UDbgModule>::add_symbol)?
-        //     .add_deref("load_symbol", <dyn UDbgModule>::load_symbol_file)?;
-
-        mt.set_closure("symbolFile", |this: &Self| {
+        mt.set_closure("addSymbol", |this: &Self, offset, name| {
+            this.add_symbol(offset, name)
+        })?
+        .set_closure("loadSymbolFromFile", |this: &Self, path| {
+            this.load_symbol_file(path)
+        })?
+        .set_closure("symbolFile", |this: &Self| {
             this.symbol_file().map(ArcSymbolFile)
         })?;
-        mt.add_method("enumSymbol", |s: &LuaState, this: &Self, pat: &str| {
-            this.enum_symbol(Some(pat))
-                .map(|x| unsafe { s.new_iter(x, [ArgRef(1)]) })
-                .lua_result()
-        })?;
-        mt.add("enum_export", |this: &Self| {
-            this.get_exports()
-                .map(|exports| StaticIter::from(exports.into_iter()))
+
+        mt.add_method(
+            "enumSymbol",
+            |lua: &LuaState, this: &Self, pat: Option<&str>| {
+                this.enum_symbol(pat)
+                    .map(|x| unsafe { lua.new_iter(x, ArgRef(1)) })
+                    .lua_result()
+            },
+        )?;
+        mt.add_method("enumExport", |lua: &LuaState, this: &Self, ()| {
+            this.symbols_data()
+                .map(|syms| syms.exports.values().cloned())
+                .map(|iter| unsafe { lua.new_iter(iter, ArgRef(1)) })
+                .transpose()
         })?;
         mt.add_method("getSymbol", |s, this: &Self, pat: &str| {
             this.enum_symbol(Some(pat))

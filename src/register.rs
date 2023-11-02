@@ -847,22 +847,11 @@ pub mod regid {
 
 use regid::*;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum CpuReg {
     Int(usize),
     Flt(f64),
-}
-
-impl serde::Serialize for CpuReg {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::Int(val) => serializer.serialize_u64(*val as _),
-            Self::Flt(val) => serializer.serialize_f64(*val),
-        }
-    }
 }
 
 impl CpuReg {
@@ -1646,16 +1635,16 @@ pub trait UDbgRegs: crate::memory::AsByteArray {
                 4 => X86_REG_RCX,
                 5 => X86_REG_R8,
                 6 => X86_REG_R9,
-                _ => return Err(i - 6),
+                _ => return Err(i.checked_sub(6).unwrap_or(0)),
             }),
             Some(Cdecl | StdCall) => Err(i),
             Some(ThisCall) => Ok(match i {
                 1 => X86_REG_ECX,
-                _ => return Err(i - 1),
+                _ => return Err(i.checked_sub(1).unwrap_or(0)),
             }),
             Some(AArch64) => Ok(match i {
-                1..=8 => ARM64_REG_X0 + (i - 1) as u32,
-                _ => return Err(i - 8),
+                1..=8 => ARM64_REG_X0 + (i.checked_sub(1).unwrap_or(0)) as u32,
+                _ => return Err(i.checked_sub(8).unwrap_or(0)),
             }),
             #[cfg(all(windows, target_arch = "x86_64"))]
             None => self.argument(i, Some(X86_64)),

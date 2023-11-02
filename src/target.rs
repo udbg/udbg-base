@@ -304,27 +304,27 @@ pub trait UDbgEngine {
     }
 
     /// Open a process, not attach, for non-invasive debugging purpose
-    fn open(&mut self, pid: pid_t) -> UDbgResult<Arc<dyn UDbgTarget>> {
+    fn open(&self, pid: pid_t) -> UDbgResult<Arc<dyn UDbgTarget>> {
         Err(UDbgError::NotSupport)
     }
 
-    fn open_self(&mut self) -> UDbgResult<Arc<dyn UDbgTarget>> {
+    fn open_self(&self) -> UDbgResult<Arc<dyn UDbgTarget>> {
         self.open(std::process::id() as _)
     }
 
     /// Attach to a active process
-    fn attach(&mut self, pid: pid_t) -> UDbgResult<Arc<dyn UDbgTarget>>;
+    fn attach(&self, pid: pid_t) -> UDbgResult<Arc<dyn UDbgTarget>>;
 
     /// Create and debug a process
     fn create(
-        &mut self,
+        &self,
         path: &str,
         cwd: Option<&str>,
         args: &[&str],
     ) -> UDbgResult<Arc<dyn UDbgTarget>>;
 
     /// Start the debug event loop, with a event callback
-    fn event_loop<'a>(&mut self, callback: &mut UDbgCallback<'a>) -> UDbgResult<()> {
+    fn event_loop<'a>(&self, callback: &mut UDbgCallback<'a>) -> UDbgResult<()> {
         Err(UDbgError::NotSupport)
     }
 

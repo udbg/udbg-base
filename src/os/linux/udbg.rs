@@ -4,17 +4,21 @@ use crate::os::udbg::{EventHandler, HandleResult};
 use crate::range::RangeValue;
 
 use anyhow::Context;
+use arc_swap::ArcSwapOption;
 use goblin::elf::sym::Sym;
 use nix::sys::ptrace::Options;
 use nix::sys::wait::waitpid;
 use parking_lot::RwLock;
 use procfs::process::{Stat as ThreadStat, Task};
 use serde_value::Value;
-use std::cell::{Cell, UnsafeCell};
 use std::collections::HashSet;
 use std::mem::transmute;
 use std::ops::Deref;
 use std::time::{Duration, Instant};
+use std::{
+    cell::{Cell, UnsafeCell},
+    sync::Arc,
+};
 
 const TRAP_BRKPT: i32 = 1;
 const TRAP_TRACE: i32 = 2;
@@ -103,6 +107,26 @@ fn to_symbol(s: ElfSym) -> Symbol {
     }
 }
 
+impl Module {
+    pub fn cache_load_syms(&self) -> Arc<SymbolsData> {
+        self.syms
+            .load_full()
+            .or_else(|| {
+                crate::symbol::MODULE_CACHE
+                    .write()
+                    .get_mut(&self.data.path)
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                let data = Arc::new(SymbolsData::from_elf(&self.data.path));
+                crate::symbol::MODULE_CACHE
+                    .write()
+                    .insert(self.data.path.clone().into(), data.clone());
+                data
+            })
+    }
+}
+
 impl SymbolsData {
     fn from_elf(path: &str) -> Self {
         let mut this = Self::default();
@@ -122,7 +146,7 @@ impl SymbolsData {
                 .or_insert_with(|| to_symbol(s));
         };
         e.enum_symbol().for_each(&mut push_symbol);
-        e.enum_export().for_each(&mut push_symbol);
+        e.enum_dynsym().for_each(&mut push_symbol);
         Ok(())
     }
 }
@@ -299,7 +323,7 @@ impl TargetCommon {
                     path: path.clone(),
                 },
                 loaded: false.into(),
-                syms: SymbolsData::from_elf(&path).into(),
+                syms: ArcSwapOption::empty(),
             });
             // TODO:
             // self.base.module_load(&path, base);
@@ -335,7 +359,7 @@ impl TargetCommon {
     pub fn handle_breakpoint(
         &self,
         this: &dyn UDbgTarget,
-        eh: &mut dyn EventHandler,
+        eh: &dyn EventHandler,
         tb: &mut TraceBuf,
     ) -> UDbgResult<HandleResult> {
         // correct the pc register
@@ -870,22 +894,21 @@ impl Target for ProcessTarget {
 impl UDbgTarget for ProcessTarget {}
 
 impl EventHandler for DefaultEngine {
-    fn fetch(&mut self, buf: &mut TraceBuf) -> Option<()> {
+    fn fetch(&self, buf: &mut TraceBuf) -> Option<()> {
         loop {
-            self.status = waitpid(None, Some(WaitPidFlag::__WALL)).ok()?;
+            let status = waitpid(None, Some(WaitPidFlag::__WALL)).ok()?;
             // info!("[status] {:?}", self.status);
-            self.tid = self
-                .status
+            buf.tid = status
                 .pid()
                 .map(|p| p.as_raw() as tid_t)
                 .unwrap_or_default();
 
             if matches!(
-                self.status,
+                status,
                 WaitStatus::Stopped(_, _) //  | WaitStatus::Signaled(_, _, _)
             ) {
-                buf.update_regs(self.tid);
-                buf.update_siginfo(self.tid);
+                buf.update_regs(buf.tid);
+                buf.update_siginfo(buf.tid);
                 // info!(
                 //     "si: {:?}, address: {:p}, ip: {:x}",
                 //     buf.si,
@@ -893,22 +916,25 @@ impl EventHandler for DefaultEngine {
                 //     *crate::register::AbstractRegs::ip(&mut buf.user)
                 // );
             }
+            *self.status.write() = status;
 
             let target = self
                 .targets
+                .read()
                 .iter()
-                .find(|&t| self.tid == t.pid() as tid_t || t.threads.read().contains(&self.tid))
+                .find(|&t| buf.tid == t.pid() as tid_t || t.threads.read().contains(&buf.tid))
                 .cloned()
                 .or_else(|| {
                     self.targets
+                        .read()
                         .iter()
-                        .find(|&t| t.process.task_from_tid(self.tid).is_ok())
+                        .find(|&t| t.process.task_from_tid(buf.tid).is_ok())
                         .cloned()
                 });
 
             if let Some(target) = target {
                 buf.target = target.clone();
-                buf.target.base.event_tid.set(self.tid as _);
+                buf.target.base.event_tid.set(buf.tid as _);
 
                 if target.base.status.get() == UDbgStatus::Detaching {
                     break;
@@ -922,29 +948,29 @@ impl EventHandler for DefaultEngine {
                 }
 
                 // set trace options for new thread
-                if buf.target.insert_thread(self.tid) {
-                    buf.call(UEvent::ThreadCreate(self.tid));
+                if buf.target.insert_thread(buf.tid) {
+                    buf.call(UEvent::ThreadCreate(buf.tid));
                     cont = true;
                 }
 
                 if cont {
-                    ptrace::cont(Pid::from_raw(self.tid), None);
+                    ptrace::cont(Pid::from_raw(buf.tid), None);
                     continue;
                 }
 
                 break;
             } else {
-                udbg_ui().warn(format!("{} is not traced", self.tid));
-                ptrace::cont(Pid::from_raw(self.tid), None);
+                udbg_ui().warn(format!("{} is not traced", buf.tid));
+                ptrace::cont(Pid::from_raw(buf.tid), None);
             }
         }
         Some(())
     }
 
-    fn handle(&mut self, buf: &mut TraceBuf) -> Option<HandleResult> {
-        let status = self.status.clone();
+    fn handle(&self, buf: &mut TraceBuf) -> Option<HandleResult> {
+        let status = self.status.read().clone();
         let this = buf.target.clone();
-        let tid = self.tid;
+        let tid = buf.tid;
 
         if this.base.status.get() == UDbgStatus::Detaching {
             return Some(None);
@@ -997,7 +1023,7 @@ impl EventHandler for DefaultEngine {
                                 } else {
                                     UDbgStatus::Detaching
                                 });
-                                self.targets.push(t);
+                                self.targets.write().push(t);
                             });
                     }
                     PTRACE_EVENT_EXEC => {
@@ -1013,10 +1039,10 @@ impl EventHandler for DefaultEngine {
                     first: false,
                     code: sig as _,
                 });
-                let code = ptrace::getevent(Pid::from_raw(self.tid)).unwrap_or(-1);
+                let code = ptrace::getevent(Pid::from_raw(buf.tid)).unwrap_or(-1);
                 if !matches!(sig, Signal::SIGSTOP) {
                     if this.remove_thread(tid, code as _, buf) {
-                        self.targets.retain(|t| !Arc::ptr_eq(t, &this));
+                        self.targets.write().retain(|t| !Arc::ptr_eq(t, &this));
                     }
                 }
                 Some(sig)
@@ -1024,7 +1050,7 @@ impl EventHandler for DefaultEngine {
             // exited normally
             WaitStatus::Exited(_, code) => {
                 if this.remove_thread(tid, code, buf) {
-                    self.targets.retain(|t| !Arc::ptr_eq(t, &this));
+                    self.targets.write().retain(|t| !Arc::ptr_eq(t, &this));
                 }
                 None
             }
@@ -1032,9 +1058,9 @@ impl EventHandler for DefaultEngine {
         })
     }
 
-    fn cont(&mut self, sig: HandleResult, buf: &mut TraceBuf) {
+    fn cont(&self, sig: HandleResult, buf: &mut TraceBuf) {
         let this = buf.target.clone();
-        let tid = Pid::from_raw(self.tid as _);
+        let tid = Pid::from_raw(buf.tid as _);
 
         if this.base.status.get() == UDbgStatus::Detaching {
             for bp in this.get_breakpoints() {
@@ -1044,11 +1070,11 @@ impl EventHandler for DefaultEngine {
                 ptrace::detach(Pid::from_raw(tid as _), None)
                     .log_error_with(|err| format!("ptrace_detach({tid}) failed: {err:?}"));
             }
-            self.targets.retain(|t| !Arc::ptr_eq(&this, t));
+            self.targets.write().retain(|t| !Arc::ptr_eq(&this, t));
             this.base.status.set(UDbgStatus::Detached);
         } else if buf.regs_dirty {
             buf.regs_dirty = false;
-            buf.write_regs(self.tid);
+            buf.write_regs(buf.tid);
         }
 
         ptrace::cont(tid, sig);
@@ -1056,10 +1082,10 @@ impl EventHandler for DefaultEngine {
 }
 
 pub struct DefaultEngine {
-    pub targets: Vec<Arc<ProcessTarget>>,
-    pub status: WaitStatus,
+    pub targets: RwLock<Vec<Arc<ProcessTarget>>>,
+    pub status: RwLock<WaitStatus>,
     pub inited: bool,
-    pub cloned_tids: HashSet<tid_t>,
+    pub cloned_tids: RwLock<HashSet<tid_t>>,
     pub tid: tid_t,
 }
 
@@ -1067,7 +1093,7 @@ impl Default for DefaultEngine {
     fn default() -> Self {
         Self {
             targets: Default::default(),
-            status: WaitStatus::StillAlive,
+            status: WaitStatus::StillAlive.into(),
             inited: false,
             tid: 0,
             cloned_tids: Default::default(),
@@ -1076,11 +1102,11 @@ impl Default for DefaultEngine {
 }
 
 impl UDbgEngine for DefaultEngine {
-    fn open(&mut self, pid: pid_t) -> UDbgResult<Arc<dyn UDbgTarget>> {
+    fn open(&self, pid: pid_t) -> UDbgResult<Arc<dyn UDbgTarget>> {
         Ok(ProcessTarget::open(pid)?)
     }
 
-    fn attach(&mut self, pid: pid_t) -> UDbgResult<Arc<dyn UDbgTarget>> {
+    fn attach(&self, pid: pid_t) -> UDbgResult<Arc<dyn UDbgTarget>> {
         let this = ProcessTarget::open(pid)?;
         // attach each of threads
         for tid in this.process.tasks()?.filter_map(|t| t.ok().map(|t| t.tid)) {
@@ -1089,12 +1115,12 @@ impl UDbgEngine for DefaultEngine {
         // wait main thread
         waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WUNTRACED))
             .with_context(|| format!("waitpid({pid})"))?;
-        self.targets.push(this.clone());
+        self.targets.write().push(this.clone());
         Ok(this)
     }
 
     fn create(
-        &mut self,
+        &self,
         path: &str,
         cwd: Option<&str>,
         args: &[&str],
@@ -1120,36 +1146,37 @@ impl UDbgEngine for DefaultEngine {
                     .with_context(|| format!("waitpid({pid})"))?;
                 let ps = Process::from_pid(pid).context("open")?;
                 let this = Arc::new(ProcessTarget(TargetCommon::new(ps)));
-                self.targets.push(this.clone());
+                self.targets.write().push(this.clone());
                 Ok(this)
             }
         }
     }
 
-    fn event_loop<'a>(&mut self, callback: &mut UDbgCallback<'a>) -> UDbgResult<()> {
-        self.targets.iter().for_each(|t| {
+    fn event_loop<'a>(&self, callback: &mut UDbgCallback<'a>) -> UDbgResult<()> {
+        self.targets.read().iter().for_each(|t| {
             t.update_module();
             t.update_memory_page();
         });
 
         let target = self
             .targets
+            .read()
             .iter()
             .next()
-            .map(Clone::clone)
+            .cloned()
             .context("no attached target")?;
 
-        self.tid = target.process.pid;
         let buf = &mut TraceBuf {
             callback,
             user: unsafe { core::mem::zeroed() },
             si: unsafe { core::mem::zeroed() },
             regs_dirty: false,
+            tid: target.process.pid,
             target,
         };
 
-        buf.target.base.event_tid.set(self.tid);
-        buf.target.insert_thread(self.tid);
+        buf.target.base.event_tid.set(buf.tid);
+        buf.target.insert_thread(buf.tid);
 
         if buf.target.base.status.get() == UDbgStatus::Detaching {
             self.cont(None, buf);
@@ -1159,12 +1186,12 @@ impl UDbgEngine for DefaultEngine {
 
         buf.call(UEvent::InitBp);
         buf.call(UEvent::ProcessCreate);
-        buf.call(UEvent::ThreadCreate(self.tid));
+        buf.call(UEvent::ThreadCreate(buf.tid));
         self.cont(None, buf);
 
         while let Some(s) = self.fetch(buf).and_then(|_| self.handle(buf)) {
             self.cont(s, buf);
-            if self.targets.is_empty() {
+            if self.targets.read().is_empty() {
                 break;
             }
         }

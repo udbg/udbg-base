@@ -1,10 +1,10 @@
 use crate::prelude::*;
 
 use core::cell::Cell;
-use std::sync::Arc;
 
 pub mod udbg;
 
+use arc_swap::ArcSwapOption;
 pub use libc::pid_t;
 
 impl Symbol {
@@ -25,23 +25,8 @@ impl Symbol {
 
 pub struct Module {
     pub data: ModuleData,
-    pub syms: SymbolsData,
     pub loaded: Cell<bool>,
-}
-
-impl Module {
-    // fn check_loaded(&self) {
-    //     if self.loaded.get() { return; }
-    //     let mut s = self.syms.write();
-    //     self.loaded.set(true);
-    //     match s.load(&self.data.path) {
-    //         Ok(_) => {
-    //         }
-    //         Err(e) => {
-    //             error!("{}", e);
-    //         }
-    //     }
-    // }
+    pub syms: ArcSwapOption<SymbolsData>,
 }
 
 impl GetProp for Module {
@@ -55,31 +40,18 @@ impl UDbgModule for Module {
         &self.data
     }
 
+    fn symbols_data(&self) -> Option<&SymbolsData> {
+        let syms = self.cache_load_syms();
+        // Safety: stored in self.syms
+        Some(unsafe { core::mem::transmute(syms.as_ref()) })
+    }
+
     fn symbol_status(&self) -> SymbolStatus {
-        if self.syms.pdb.read().is_some() {
+        if self.cache_load_syms().pdb.read().is_some() {
             SymbolStatus::Loaded
         } else {
             SymbolStatus::Unload
         }
-    }
-    fn add_symbol(&self, offset: usize, name: &str) -> UDbgResult<()> {
-        self.syms.add_symbol(offset, name)
-    }
-    fn find_symbol(&self, offset: usize, max_offset: usize) -> Option<Symbol> {
-        self.syms.find_symbol(offset, max_offset)
-    }
-    fn get_symbol(&self, name: &str) -> Option<Symbol> {
-        self.syms.get_symbol(name)
-    }
-    fn symbol_file(&self) -> Option<Arc<dyn SymbolFile>> {
-        self.syms.pdb.read().clone()
-    }
-
-    fn enum_symbol(&self, pat: Option<&str>) -> UDbgResult<Box<dyn Iterator<Item = Symbol>>> {
-        Ok(Box::new(self.syms.enum_symbol(pat)?))
-    }
-    fn get_exports(&self) -> Option<Vec<Symbol>> {
-        Some(self.syms.exports.iter().map(|i| i.1.clone()).collect())
     }
 
     // TODO: dwarf
