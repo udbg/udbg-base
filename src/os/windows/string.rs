@@ -7,6 +7,7 @@ use crate::string::*;
 use ntapi::ntrtl::RtlInitUnicodeString;
 use std::ffi::OsString;
 use std::os::windows::prelude::*;
+use windows::core::PCWSTR;
 
 use winapi::{shared::ntdef::*, um::stringapiset::*};
 
@@ -193,7 +194,8 @@ impl FromWide for String {
             return "".into();
         }
         unsafe {
-            let r = std::slice::from_raw_parts(p, usize::MAX);
+            let pcw = PCWSTR::from_raw(p);
+            let r = pcw.as_wide();
             String::from_wide(&r[..r.iter().position(|&v| v == 0).unwrap_or(r.len())])
         }
     }

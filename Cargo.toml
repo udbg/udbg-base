@@ -40,7 +40,7 @@ memmap2 = {version = '0.9'}
 cpp_demangle = {version = '0.4'}
 bitflags = {version = '2.0', features = ['serde']}
 capstone = {version = '0.12', optional = true}
-minidump = {version = '0.21', optional = true}
+minidump = {version = '0.22', optional = true}
 symbolic = {version = '12.8', optional = true}
 symbolic-demangle = {version = '12.8', default-features = false, features = ["cpp", "msvc", "rust"], optional = true}
 memoffset = {version = '0.9', features = ['unstable_const']}
@@ -54,7 +54,7 @@ path = 'src/tracee/main.rs'
 
 [target.'cfg(windows)'.dependencies]
 winapi = {version = '0.3.9', features = ["winnt", "errhandlingapi", "winuser", "winbase", "stringapiset"]}
-windows = {version = '0.52', features = [
+windows = {version = '0.58', features = [
     "implement",
     "Foundation",
     "Foundation_Collections",
@@ -98,9 +98,9 @@ mach_o_sys = '0.1'
 cc = '1'
 
 [dev-dependencies]
-flexi_logger = '0.27'
+flexi_logger = '0.28'
 tempfile = '3.6'
-minidump-writer = '0.8'
+minidump-writer = '0.9'
 rustyline = {version = '13'}
 clap = {version = "4", features = ["derive", "env"]}
 ezlua = {version = '0.5', features = ['vendored']}

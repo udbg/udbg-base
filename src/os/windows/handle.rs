@@ -1,10 +1,7 @@
 use std::{fmt::Debug, os::windows::prelude::*};
 
 use windows::Win32::{
-    Foundation::{
-        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
-        WAIT_EVENT,
-    },
+    Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_EVENT},
     System::Threading::{GetCurrentProcess, WaitForSingleObject, INFINITE},
 };
 
@@ -21,11 +18,11 @@ impl Handle {
 
     #[inline(always)]
     pub fn is_valid(&self) -> bool {
-        self.0 != INVALID_HANDLE_VALUE
+        self.0.is_invalid()
     }
 
     pub fn is_null(&self) -> bool {
-        self.0 .0 == 0
+        self.0 .0.is_null()
     }
 
     pub fn as_windows_handle(&self) -> HANDLE {

@@ -77,7 +77,7 @@ impl UserData for ArcTarget {
                 }
             })?;
         #[cfg(windows)]
-        fields.set_closure("handle", |this: &Self| this.handle().0)?;
+        fields.set_closure("handle", |this: &Self| this.handle().0 as usize)?;
         Ok(())
     }
 
@@ -554,7 +554,7 @@ impl UserData for BoxThread {
         #[cfg(windows)]
         fields.set_closure("wow64", |this: &Self| this.wow64)?;
         #[cfg(windows)]
-        fields.set_closure("handle", |this: &Self| this.handle.0 .0 .0)?;
+        fields.set_closure("handle", |this: &Self| this.handle.0 .0 .0 as usize)?;
         #[cfg(windows)]
         fields.set_closure("entry", |this: &Self| this.entry())?;
         #[cfg(windows)]
